@@ -19,7 +19,10 @@ class Index(T.Mapping[str, T.List[T.Any]], T.Generic[FieldIdTypeVar, FieldTypeVa
 
     @abc.abstractmethod
     def subindex(
-        self, filter_by_keys: T.Mapping[str, T.Any] = {}, **query: T.Any
+        self,
+        filter_by_keys: T.Mapping[str, T.Any] = {},
+        strict_occurrence: bool = True,
+        **query: T.Any,
     ) -> "Index[FieldIdTypeVar, FieldTypeVar]":
         pass
 

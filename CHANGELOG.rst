@@ -5,6 +5,13 @@ Changelog for cfgrib
 unreleased
 ----------
 
+- Add ``duplicate_messages="stack"`` to keep every GRIB message that repeats the same
+  non-spatial coordinates (same time, step, level, member, ...) instead of only the first one.
+  The new ``grib_occurrence`` coordinate numbers the occurrences within each cell, and the
+  ``filter_by_keys={"grib_occurrence": ...}`` virtual key selects single occurrences by their
+  original ordinal. The default, ``duplicate_messages="first"``, keeps the previous behaviour.
+  See ``tests/test_55_duplicate_messages.py`` for generated-data regression tests.
+
 - Setup and apply linters via pre-commit.
   See `#439 <https://github.com/ecmwf/cfgrib/pull/439>`_.
 

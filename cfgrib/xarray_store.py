@@ -93,17 +93,27 @@ def open_variable_datasets(path, backend_kwargs={}, **kwargs):
     # type: (str, T.Dict[str, T.Any], T.Any) -> T.List[xr.Dataset]
     fileindex_kwargs = {
         key: backend_kwargs[key]
-        for key in ["filter_by_keys", "indexpath"]
+        for key in ["filter_by_keys", "indexpath", "duplicate_messages"]
         if key in backend_kwargs
     }
     errors = backend_kwargs.get("errors", "warn")
     stream = messages.FileStream(path, errors=errors)
     index = open_fileindex(stream, computed_keys=cfmessage.COMPUTED_KEYS, **fileindex_kwargs)
+    # NOTE: with a ``grib_occurrence`` filter, parameters whose messages were all filtered out
+    #   must still be represented: list them over the coordinate range selected by the ordinary
+    #   GRIB conditions only and keep them as all-NaN variables. A filter that matches nothing
+    #   in the whole file is still rejected by ``open_fileindex`` above.
+    range_index = getattr(index, "range_index", None)
+    param_ids = sorted((range_index if range_index is not None else index)["paramId"])
     datasets = []  # type: T.List[xr.Dataset]
-    for param_id in sorted(index["paramId"]):
+    for param_id in param_ids:
         bk = backend_kwargs.copy()
         bk["filter_by_keys"] = backend_kwargs.get("filter_by_keys", {}).copy()
         bk["filter_by_keys"]["paramId"] = param_id
+        if range_index is not None:
+            # NOTE: a single variable may legitimately have no message for the selected
+            #   occurrence; keep it as an all-NaN variable instead of raising.
+            bk["strict_occurrence"] = False
         datasets.extend(raw_open_datasets(path, bk, **kwargs))
     return datasets
 
@@ -114,6 +124,10 @@ def open_datasets(path, backend_kwargs={}, **kwargs):
     Open a GRIB file grouping incompatible hypercubes to different datasets via simple heuristics.
     """
     squeeze = backend_kwargs.get("squeeze", True)
+    duplicate_messages = backend_kwargs.get(
+        "duplicate_messages", messages.DUPLICATE_MESSAGES_FIRST
+    )
+    duplicate_messages = messages.resolve_duplicate_messages(duplicate_messages)
     backend_kwargs = backend_kwargs.copy()
     backend_kwargs["squeeze"] = False
     datasets = open_variable_datasets(path, backend_kwargs=backend_kwargs, **kwargs)
@@ -125,9 +139,19 @@ def open_datasets(path, backend_kwargs={}, **kwargs):
             type_of_level_datasets.setdefault(type_of_level, []).append(ds)
 
     merged = []  # type: T.List[xr.Dataset]
+    # NOTE: in "stack" mode the occurrence axis carries real information, so it must survive
+    #   the final squeeze even when a dataset ends up with a single occurrence. Other size-1
+    #   dimensions keep being squeezed exactly as before.
+    stacked = duplicate_messages == messages.DUPLICATE_MESSAGES_STACK
+    keep_dims = {messages.GRIB_OCCURRENCE_KEY} if stacked else set()
     for type_of_level in sorted(type_of_level_datasets):
         for ds in merge_datasets(
             type_of_level_datasets[type_of_level], join="exact", combine_attrs="identical"
         ):
-            merged.append(ds.squeeze() if squeeze else ds)
+            if squeeze:
+                to_squeeze = [
+                    dim for dim, size in ds.sizes.items() if size == 1 and dim not in keep_dims
+                ]
+                ds = ds.squeeze(to_squeeze)
+            merged.append(ds)
     return merged

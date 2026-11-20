@@ -19,6 +19,7 @@
 #
 
 import datetime
+import itertools
 import json
 import logging
 import os
@@ -228,6 +229,11 @@ COORD_ATTRS = {
         "standard_name": "realization",
         "long_name": "ensemble member numerical id",
     },
+    # duplicate messages
+    "grib_occurrence": {
+        "units": "1",
+        "long_name": "occurrence index of a GRIB message within a header coordinate cell",
+    },
     # time
     "step": {
         "units": "hours",
@@ -347,9 +353,19 @@ class OnDiskArray:
     missing_value: float
     geo_ndim: int = attr.attrib(default=1, repr=False)
     dtype: np.dtype = attr.attrib(default=messages.DEFAULT_VALUES_DTYPE, repr=False)
+    # NOTE: the two attributes below are set only when duplicate messages are kept. They allow
+    #   addressing a single message per (non-occurrence) header cell and per occurrence, without
+    #   scanning the whole index and without decoding messages that were not selected.
+    occurrence_axis: T.Optional[int] = attr.attrib(default=None, repr=False)
+    occurrence_values: T.Optional[np.ndarray] = attr.attrib(default=None, repr=False)
+    cell_field_ids: T.Optional[
+        T.Dict[T.Tuple[T.Any, ...], T.Dict[T.Any, T.Any]]
+    ] = attr.attrib(default=None, repr=False)
 
     def build_array(self) -> np.ndarray:
         """Helper method used to test __getitem__"""
+        if self.cell_field_ids is not None:
+            return self.__getitem__(tuple(slice(None) for _ in self.shape))
         array = np.full(self.shape, fill_value=np.nan, dtype=self.dtype)
         for header_indexes, message_ids in self.field_id_index.items():
             # NOTE: fill a single field as found in the message
@@ -359,8 +375,52 @@ class OnDiskArray:
         array[array == self.missing_value] = np.nan
         return array
 
+    def _getitem_stacked(self, item: T.Tuple[T.Any, ...]) -> np.ndarray:
+        # NOTE: occurrence-aware lookup: only the selected header cells and the selected
+        #   occurrences are decoded. Missing (cell, occurrence) combinations stay NaN.
+        header_item_list = expand_item(item[: -self.geo_ndim], self.shape)
+        array_field_shape = tuple(len(i) for i in header_item_list) + self.shape[-self.geo_ndim :]
+        array_field = np.full(array_field_shape, fill_value=np.nan, dtype=self.dtype)
+        occurrence_axis = self.occurrence_axis  # type: ignore
+        assert occurrence_axis is not None and self.cell_field_ids is not None
+        assert self.occurrence_values is not None
+        other_axes = [axis for axis in range(len(header_item_list)) if axis != occurrence_axis]
+        occurrence_labels = self.occurrence_values.tolist()
+        # NOTE: iterate over the output header cells, not over their distinct values, so that
+        #   repeated positions in the requested item are all filled.
+        other_positions_iter = itertools.product(
+            *[range(len(header_item_list[axis])) for axis in other_axes]
+        )
+        for other_positions in other_positions_iter:
+            cell = tuple(
+                header_item_list[axis][position]
+                for axis, position in zip(other_axes, other_positions)
+            )
+            for occurrence_position in range(len(header_item_list[occurrence_axis])):
+                occurrence_label = occurrence_labels[
+                    header_item_list[occurrence_axis][occurrence_position]
+                ]
+                message_id = self.cell_field_ids.get((cell, occurrence_label))
+                if message_id is None:
+                    continue
+                array_field_indexes = list(other_positions)
+                array_field_indexes.insert(occurrence_axis, occurrence_position)
+                array_field_indexes_t = tuple(array_field_indexes)
+                message = self.index.get_field(message_id)
+                values = get_values_in_order(message, array_field[array_field_indexes_t].shape)
+                array_field[array_field_indexes_t].flat[:] = values
+
+        array = np.asarray(array_field[(Ellipsis,) + item[-self.geo_ndim :]])
+        array[array == self.missing_value] = np.nan
+        for i, it in reversed(list(enumerate(item[: -self.geo_ndim]))):
+            if isinstance(it, int):
+                array = array[(slice(None, None, None),) * i + (0,)]
+        return array
+
     def __getitem__(self, item):
         # type: (T.Tuple[T.Any, ...]) -> np.ndarray
+        if self.cell_field_ids is not None:
+            return self._getitem_stacked(item)
         header_item_list = expand_item(item[: -self.geo_ndim], self.shape)
         header_item = [{ix: i for i, ix in enumerate(it)} for it in header_item_list]
         array_field_shape = tuple(len(i) for i in header_item_list) + self.shape[-self.geo_ndim :]
@@ -486,36 +546,31 @@ def read_data_var_attrs(first: abc.Field, extra_keys: T.List[str]) -> T.Dict[str
     return attributes
 
 
-def build_variable_components(
+def build_header_coords(
     index: abc.Index[T.Any, abc.Field],
-    encode_cf: T.Sequence[str] = (),
-    filter_by_keys: T.Dict[str, T.Any] = {},
-    log: logging.Logger = LOG,
-    errors: str = "warn",
-    squeeze: bool = True,
-    read_keys: T.Iterable[str] = (),
-    time_dims: T.Sequence[str] = ("time", "step"),
-    extra_coords: T.Dict[str, str] = {},
-    coords_as_attributes: T.Dict[str, str] = {},
-    cache_geo_coords: bool = True,
-    values_dtype: np.dtype = messages.DEFAULT_VALUES_DTYPE,
-) -> T.Tuple[T.Dict[str, int], Variable, T.Dict[str, Variable]]:
-    data_var_attrs = enforce_unique_attributes(index, DATA_ATTRIBUTES_KEYS, filter_by_keys)
-    grid_type_keys = GRID_TYPE_MAP.get(index.getone("gridType"), [])
-    extra_keys = sorted(list(read_keys) + EXTRA_DATA_ATTRIBUTES_KEYS + grid_type_keys)
-    first = index.first()
-    extra_attrs = read_data_var_attrs(first, extra_keys)
-    data_var_attrs.update(**extra_attrs)
-    coords_map = encode_cf_first(
-        data_var_attrs,
-        encode_cf,
-        time_dims,
-    )
+    range_index: abc.Index[T.Any, abc.Field],
+    coords_map: T.Sequence[str],
+    data_var_attrs: T.MutableMapping[str, T.Any],
+    encode_cf: T.Sequence[str],
+    squeeze: bool,
+    occurrence_labels: T.Optional[T.Sequence[int]],
+    coords_as_attributes: T.Mapping[str, str],
+    log: logging.Logger,
+) -> T.Tuple[T.Dict[str, str], T.Dict[str, Variable]]:
     coord_name_key_map = {}
     coord_vars = {}
     for coord_key in coords_map:
-        values = index[coord_key]
-        if len(values) == 1 and values[0] == "undef":
+        if coord_key.partition(":")[0] == messages.GRIB_OCCURRENCE_KEY:
+            # NOTE: the occurrence axis is dataset-wide: it lists the ordinals that exist in
+            #   the whole selected range, so that each variable keeps the same labels and the
+            #   missing occurrences are NaN.
+            if occurrence_labels is not None:
+                values = list(occurrence_labels)
+            else:
+                values = index.get(coord_key) or range_index.get(coord_key) or []
+        else:
+            values = range_index[coord_key]
+        if not values or (len(values) == 1 and values[0] == "undef"):
             log.debug("missing from GRIB stream: %r" % coord_key)
             continue
         orig_name = coord_key.partition(":")[0]
@@ -535,35 +590,49 @@ def build_variable_components(
             "units": "1",
         }
         attributes.update(COORD_ATTRS.get(coord_name, {}).copy())
-        data = np.array(sorted(values, reverse=attributes.get("stored_direction") == "decreasing"))
+        if coord_name == messages.GRIB_OCCURRENCE_KEY and occurrence_labels is not None:
+            # NOTE: use the run-wide occurrence axis so that variables with fewer occurrences
+            #   keep the same labels and the missing occurrences are simply NaN.
+            data = np.array(sorted(occurrence_labels), dtype=int, ndmin=1)
+        else:
+            data = np.array(
+                sorted(values, reverse=attributes.get("stored_direction") == "decreasing")
+            )
         dimensions = (coord_name,)  # type: T.Tuple[str, ...]
-        if squeeze and len(values) == 1:
+        # NOTE: the occurrence axis must be kept even when it has a single entry so that a
+        #   duplicate is not silently collapsed back to the "first" behaviour.
+        if squeeze and len(values) == 1 and coord_name != messages.GRIB_OCCURRENCE_KEY:
             data = data[0]
             dimensions = ()
         coord_vars[coord_name] = Variable(dimensions=dimensions, data=data, attributes=attributes)
+    return coord_name_key_map, coord_vars
 
-    header_dimensions = tuple(d for d, c in coord_vars.items() if not squeeze or c.data.size > 1)
-    header_shape = tuple(coord_vars[d].data.size for d in header_dimensions)
 
-    gds_md5sum = index.get("md5GridSection")
-    # If parameter is associated with a single grid definition, try to cache geometry
-    if cache_geo_coords and gds_md5sum and len(gds_md5sum) == 1:
-        md5sum = gds_md5sum[0]
-        cache_key = (md5sum, tuple(encode_cf))
-        if cache_key in GEOCACHE:
-            log.debug(f"cache hit for {cache_key}; using cached geometry")
-            geo_coords = GEOCACHE[cache_key]
-        else:
-            geo_coords = build_geography_coordinates(index.first(), encode_cf, errors)
-            GEOCACHE[cache_key] = geo_coords
-    else:
-        geo_coords = build_geography_coordinates(index.first(), encode_cf, errors)
+def build_cell_field_ids(
+    header_dimensions: T.Tuple[str, ...],
+    occurrence_values: np.ndarray,
+    offsets: T.Mapping[T.Tuple[int, ...], T.List[T.Any]],
+) -> T.Dict[T.Tuple[T.Any, ...], T.Dict[int, T.Any]]:
+    """Map a non-spatial coordinate cell and an occurrence label to a single message id."""
+    occurrence_axis = header_dimensions.index(messages.GRIB_OCCURRENCE_KEY)
+    other_axes = [axis for axis in range(len(header_dimensions)) if axis != occurrence_axis]
+    cell_field_ids = {}
+    for header_indexes, message_ids in offsets.items():
+        cell = tuple(header_indexes[axis] for axis in other_axes)
+        occurrence_label = int(occurrence_values[header_indexes[occurrence_axis]])
+        # NOTE: keep the first message in source order if a hidden index key splits the same
+        #   coordinate cell twice.
+        cell_field_ids.setdefault((cell, occurrence_label), message_ids[0])
+    return cell_field_ids
 
-    geo_dims, geo_shape, geo_coord_vars = geo_coords
-    dimensions = header_dimensions + geo_dims
-    shape = header_shape + geo_shape
-    coord_vars.update(geo_coord_vars)
 
+def build_field_id_index(
+    index: abc.Index[T.Any, abc.Field],
+    coord_vars: T.Mapping[str, Variable],
+    coord_name_key_map: T.Mapping[str, str],
+    header_dimensions: T.Tuple[str, ...],
+    extra_coords: T.Mapping[str, str],
+) -> T.Tuple[T.Dict[T.Tuple[int, ...], T.List[T.Any]], T.Dict[str, T.Dict[T.Any, T.Any]]]:
     offsets = {}  # type: T.Dict[T.Tuple[int, ...], T.List[T.Union[int, T.Tuple[int, int]]]]
     header_value_index = {}
     extra_coords_data: T.Dict[str, T.Dict[str, T.Any]] = {
@@ -598,6 +667,108 @@ def build_variable_components(
 
                     extra_coords_data[coord_name][header_value] = coord_value
         offsets[tuple(header_indexes)] = message_ids
+    return offsets, extra_coords_data
+
+
+def build_variable_components(
+    index: abc.Index[T.Any, abc.Field],
+    encode_cf: T.Sequence[str] = (),
+    filter_by_keys: T.Dict[str, T.Any] = {},
+    log: logging.Logger = LOG,
+    errors: str = "warn",
+    squeeze: bool = True,
+    read_keys: T.Iterable[str] = (),
+    time_dims: T.Sequence[str] = ("time", "step"),
+    extra_coords: T.Dict[str, str] = {},
+    coords_as_attributes: T.Dict[str, str] = {},
+    cache_geo_coords: bool = True,
+    values_dtype: np.dtype = messages.DEFAULT_VALUES_DTYPE,
+    occurrence_labels: T.Optional[T.Sequence[int]] = None,
+    range_index: T.Optional[abc.Index[T.Any, abc.Field]] = None,
+) -> T.Tuple[T.Dict[str, int], Variable, T.Dict[str, Variable]]:
+    # NOTE: ``index`` holds the messages that are actually read, while ``range_index`` defines
+    #   the coordinate space selected by the ordinary GRIB conditions only. They differ when a
+    #   ``grib_occurrence`` filter is active: a cell missing a selected occurrence keeps its
+    #   coordinates and is filled with NaN instead of being dropped.
+    if range_index is None:
+        range_index = index
+    # NOTE: a variable may have no message at all for the selected occurrence. Its coordinates
+    #   still come from ``range_index`` and its values are all NaN, so the attributes must be
+    #   read from whichever index actually carries the variable headers.
+    attr_index = index if len(index.field_ids_index) else range_index
+
+    data_var_attrs = enforce_unique_attributes(attr_index, DATA_ATTRIBUTES_KEYS, filter_by_keys)
+    grid_type_keys = GRID_TYPE_MAP.get(range_index.getone("gridType"), [])
+    extra_keys = sorted(list(read_keys) + EXTRA_DATA_ATTRIBUTES_KEYS + grid_type_keys)
+    first = range_index.first()
+    extra_attrs = read_data_var_attrs(first, extra_keys)
+    data_var_attrs.update(**extra_attrs)
+    coords_map = encode_cf_first(
+        data_var_attrs,
+        encode_cf,
+        time_dims,
+    )
+    # NOTE: the occurrence axis is present only when the index was built to keep duplicates.
+    if messages.GRIB_OCCURRENCE_KEY in index.index_keys:
+        coords_map.append(messages.GRIB_OCCURRENCE_KEY)
+    coord_name_key_map, coord_vars = build_header_coords(
+        index,
+        range_index,
+        coords_map,
+        data_var_attrs,
+        encode_cf,
+        squeeze,
+        occurrence_labels,
+        coords_as_attributes,
+        log,
+    )
+
+    # NOTE: the occurrence axis is always a dimension in "stack" mode, even when its longest
+    #   run is a single message, so that squeeze never hides the fact that duplicates are kept.
+    header_dimensions = tuple(
+        d
+        for d, c in coord_vars.items()
+        if not squeeze or c.data.size > 1 or d == messages.GRIB_OCCURRENCE_KEY
+    )
+    header_shape = tuple(coord_vars[d].data.size for d in header_dimensions)
+
+    gds_md5sum = range_index.get("md5GridSection")
+    # If parameter is associated with a single grid definition, try to cache geometry
+    if cache_geo_coords and gds_md5sum and len(gds_md5sum) == 1:
+        md5sum = gds_md5sum[0]
+        cache_key = (md5sum, tuple(encode_cf))
+        if cache_key in GEOCACHE:
+            log.debug(f"cache hit for {cache_key}; using cached geometry")
+            geo_coords = GEOCACHE[cache_key]
+        else:
+            geo_coords = build_geography_coordinates(range_index.first(), encode_cf, errors)
+            GEOCACHE[cache_key] = geo_coords
+    else:
+        geo_coords = build_geography_coordinates(range_index.first(), encode_cf, errors)
+
+    geo_dims, geo_shape, geo_coord_vars = geo_coords
+    dimensions = header_dimensions + geo_dims
+    shape = header_shape + geo_shape
+    coord_vars.update(geo_coord_vars)
+
+    offsets, extra_coords_data = build_field_id_index(
+        index, coord_vars, coord_name_key_map, header_dimensions, extra_coords
+    )
+
+    # NOTE: when the occurrence axis is present, keep a sparse mapping from a non-spatial
+    #   coordinate cell (identified by its coordinate labels) plus an occurrence label to a
+    #   single message id. This is proportional to the number of messages, never to the
+    #   cartesian product of the header axes times the number of grid points, and it lets
+    #   ``OnDiskArray`` decode only the messages that are actually selected.
+    occurrence_axis = None
+    occurrence_values = None
+    cell_field_ids = None
+    if messages.GRIB_OCCURRENCE_KEY in header_dimensions:
+        occurrence_axis = header_dimensions.index(messages.GRIB_OCCURRENCE_KEY)
+        run = coord_vars[messages.GRIB_OCCURRENCE_KEY].data
+        occurrence_values = np.array(run, dtype=int, ndmin=1)
+        cell_field_ids = build_cell_field_ids(header_dimensions, occurrence_values, offsets)
+
     missing_value = data_var_attrs.get("missingValue", messages.MISSING_VAUE_INDICATOR)
     on_disk_array = OnDiskArray(
         index=index,
@@ -606,6 +777,9 @@ def build_variable_components(
         missing_value=missing_value,
         geo_ndim=len(geo_dims),
         dtype=values_dtype,
+        occurrence_axis=occurrence_axis,
+        occurrence_values=occurrence_values,
+        cell_field_ids=cell_field_ids,
     )
 
     if "time" in coord_vars and "step" in coord_vars:
@@ -667,6 +841,27 @@ def build_dataset_attributes(index, filter_by_keys, encoding):
     return attributes
 
 
+def compute_occurrence_labels(
+    index: abc.Index[T.Any, abc.Field],
+) -> T.Optional[T.List[int]]:
+    """Return the ordinal labels of the occurrence axis shared by a whole dataset."""
+    # NOTE: the labels are the ordinals that both exist in the selected range and were
+    #   selected, so they are read from the filtered index whenever it still has messages.
+    range_index = getattr(index, "range_index", None)
+    fallback_index = range_index if range_index is not None else index
+    axis_index = index if index.field_ids_index else fallback_index
+    if messages.GRIB_OCCURRENCE_KEY not in axis_index.index_keys:
+        return None
+    if index.field_ids_index:
+        return sorted(set(index[messages.GRIB_OCCURRENCE_KEY]))
+    # NOTE: the variable has no message for any selected occurrence, but it must not be
+    #   dropped: keep the selected ordinals and fill the whole variable with NaN.
+    selected = index.filter_by_keys.get(messages.GRIB_OCCURRENCE_KEY)
+    if selected is None:
+        selected = axis_index.get(messages.GRIB_OCCURRENCE_KEY, [])
+    return sorted(set(selected))
+
+
 def build_dataset_components(
     index: abc.Index[T.Any, abc.Field],
     errors: str = "warn",
@@ -692,7 +887,19 @@ def build_dataset_components(
             f"{ALL_REF_TIME_KEYS}"
         )
 
-    for param_id in index.get("paramId", []):
+    # NOTE: the occurrence axis is shared by all the variables in the dataset, so that a
+    #   variable with fewer occurrences keeps the dataset-wide labels and is filled with NaN
+    #   where it has no message instead of losing the axis or being renumbered.
+    range_index = getattr(index, "range_index", None)
+    occurrence_labels = compute_occurrence_labels(index)
+
+    # NOTE: with a ``grib_occurrence`` filter the coordinate range comes from the index of all
+    #   the messages selected by the ordinary conditions, so variables without any message for
+    #   the selected occurrence are still represented as an all-NaN variable.
+    param_index = range_index if range_index is not None else index
+    param_ids = sorted(set(param_index.get("paramId", [])))
+
+    for param_id in param_ids:
         var_index = index.subindex(paramId=param_id)
         try:
             dims, data_var, coord_vars = build_variable_components(
@@ -707,6 +914,8 @@ def build_dataset_components(
                 coords_as_attributes=coords_as_attributes,
                 cache_geo_coords=cache_geo_coords,
                 values_dtype=values_dtype,
+                occurrence_labels=occurrence_labels,
+                range_index=getattr(var_index, "range_index", None),
             )
         except DatasetBuildError as ex:
             # NOTE: When a variable has more than one value for an attribute we need to raise all
@@ -756,8 +965,16 @@ def compute_index_keys(
     time_dims: T.Sequence[str] = ("time", "step"),
     extra_coords: T.Dict[str, str] = {},
     filter_by_keys: T.Dict[str, T.Any] = {},
+    duplicate_messages: T.Any = messages.DUPLICATE_MESSAGES_FIRST,
 ) -> T.List[str]:
-    return sorted(set(INDEX_KEYS) | set(filter_by_keys) | set(time_dims) | set(extra_coords))
+    keys = set(INDEX_KEYS) | {
+        k for k in filter_by_keys if k.partition(":")[0] != messages.GRIB_OCCURRENCE_KEY
+    }
+    keys |= set(time_dims) | set(extra_coords)
+    mode = messages.resolve_duplicate_messages(duplicate_messages)
+    if mode == messages.DUPLICATE_MESSAGES_STACK:
+        keys.add(messages.GRIB_OCCURRENCE_KEY)
+    return sorted(keys)
 
 
 def open_from_index(
@@ -773,6 +990,14 @@ def open_from_index(
     return Dataset(dimensions, variables, attributes, encoding)
 
 
+def _prepare_indexing(
+    filter_by_keys: T.Dict[str, T.Any], duplicate_messages: T.Any
+) -> T.Tuple[str, T.Dict[str, T.Any]]:
+    # NOTE: ``messages.normalize_filter_by_keys`` validates the mode and the occurrence filter
+    #   together, so that ``first`` mode can never silently ignore a ``grib_occurrence`` query.
+    return messages.normalize_filter_by_keys(filter_by_keys, duplicate_messages)
+
+
 def open_fieldset(
     fieldset: T.Union[abc.Fieldset[abc.Field], abc.MappingFieldset[T.Any, abc.Field]],
     indexpath: T.Optional[str] = None,
@@ -782,6 +1007,8 @@ def open_fieldset(
     time_dims: T.Sequence[str] = ("time", "step"),
     extra_coords: T.Dict[str, str] = {},
     computed_keys: messages.ComputedKeysType = cfmessage.COMPUTED_KEYS,
+    duplicate_messages: str = messages.DUPLICATE_MESSAGES_FIRST,
+    strict_occurrence: bool = True,
     log: logging.Logger = LOG,
     **kwargs: T.Any,
 ) -> Dataset:
@@ -789,10 +1016,11 @@ def open_fieldset(
     if indexpath is not None and indexpath is not messages.DEFAULT_INDEXPATH:
         log.warning(f"indexpath value {indexpath} is ignored")
 
-    index_keys = compute_index_keys(time_dims, extra_coords, filter_by_keys)
+    mode, filter_by_keys = _prepare_indexing(filter_by_keys, duplicate_messages)
+    index_keys = compute_index_keys(time_dims, extra_coords, filter_by_keys, mode)
     index_keys = [key for key in index_keys if key not in ignore_keys]
     index = messages.FieldsetIndex.from_fieldset(fieldset, index_keys, computed_keys)
-    filtered_index = index.subindex(filter_by_keys)
+    filtered_index = index.subindex(filter_by_keys, strict_occurrence=strict_occurrence)
     return open_from_index(filtered_index, read_keys, time_dims, extra_coords, **kwargs)
 
 
@@ -803,13 +1031,20 @@ def open_fileindex(
     ignore_keys: T.Sequence[str] = [],
     filter_by_keys: T.Dict[str, T.Any] = {},
     computed_keys: messages.ComputedKeysType = cfmessage.COMPUTED_KEYS,
+    duplicate_messages: T.Any = messages.DUPLICATE_MESSAGES_FIRST,
+    strict_occurrence: bool = True,
 ) -> messages.FileIndex:
-    index_keys = sorted(set(index_keys) | set(filter_by_keys))
-    index_keys = [key for key in index_keys if key not in ignore_keys]
+    mode, filter_by_keys = _prepare_indexing(filter_by_keys, duplicate_messages)
+    keys = set(index_keys) | {
+        k for k in filter_by_keys if k.partition(":")[0] != messages.GRIB_OCCURRENCE_KEY
+    }
+    if mode == messages.DUPLICATE_MESSAGES_STACK:
+        keys.add(messages.GRIB_OCCURRENCE_KEY)
+    index_keys = [key for key in sorted(keys) if key not in ignore_keys]
     index = messages.FileIndex.from_indexpath_or_filestream(
         stream, index_keys, indexpath=indexpath, computed_keys=computed_keys
     )
-    return index.subindex(filter_by_keys)
+    return index.subindex(filter_by_keys, strict_occurrence=strict_occurrence)
 
 
 def open_file(
@@ -821,13 +1056,22 @@ def open_file(
     time_dims: T.Sequence[str] = ("time", "step"),
     extra_coords: T.Dict[str, str] = {},
     ignore_keys: T.Sequence[str] = [],
+    duplicate_messages: T.Any = messages.DUPLICATE_MESSAGES_FIRST,
+    strict_occurrence: bool = True,
     **kwargs: T.Any,
 ) -> Dataset:
     """Open a GRIB file as a ``cfgrib.Dataset``."""
     path = os.fspath(path)
     stream = messages.FileStream(path, errors=errors)
-    index_keys = compute_index_keys(time_dims, extra_coords)
+    mode, filter_by_keys = _prepare_indexing(filter_by_keys, duplicate_messages)
+    index_keys = compute_index_keys(time_dims, extra_coords, filter_by_keys, mode)
     index = open_fileindex(
-        stream, indexpath, index_keys, ignore_keys=ignore_keys, filter_by_keys=filter_by_keys
+        stream,
+        indexpath,
+        index_keys,
+        ignore_keys=ignore_keys,
+        filter_by_keys=filter_by_keys,
+        duplicate_messages=mode,
+        strict_occurrence=strict_occurrence,
     )
     return open_from_index(index, read_keys, time_dims, extra_coords, errors=errors, **kwargs)

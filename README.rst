@@ -297,9 +297,67 @@ you can use:
         history:                 ...
 
 
+Duplicate messages
+------------------
+
+By default, when two GRIB messages carry the same value for every non-spatial coordinate
+(time, step, level, ensemble member, ...), *cfgrib* keeps only the first one, exactly as before.
+If you want to keep all of them, open the file with
+``backend_kwargs={"duplicate_messages": "stack"}``:
+
+.. code-block:: python
+
+    >>> ds = xr.open_dataset('duplicates.grib2', engine='cfgrib',
+    ...     backend_kwargs={'duplicate_messages': 'stack'})
+    >>> ds
+    <xarray.Dataset>
+    Dimensions:          (step: 2, grib_occurrence: 2, latitude: 3, longitude: 4)
+    Coordinates:
+      * step             (step) timedelta64[ns] 00:00:00 06:00:00
+      * grib_occurrence  (grib_occurrence) int64 0 1
+      * latitude         (latitude) float64 10.0 5.0 0.0
+      * longitude        (longitude) float64 0.0 10.0 20.0 30.0
+    Data variables:
+        t                (step, grib_occurrence, latitude, longitude) float32 ...
+
+The ``grib_occurrence`` coordinate numbers the occurrences of each non-spatial coordinate cell
+from ``0`` in the order the messages appear in the source; two messages with identical values
+still count as two occurrences. It is an ordinal inside a single cell only: occurrence ``n`` of
+one variable is not related to occurrence ``n`` of another variable. The axis is as long as the
+longest run in the selected range and the missing positions are ``NaN``; it is never squeezed
+away, not even when there is a single occurrence.
+
+You can select specific occurrences with the virtual ``grib_occurrence`` key. The value may be a
+non-negative integer or a non-empty list of non-negative integers, and the selected labels keep
+their original ordinals (selecting ``2`` yields the label ``2``, not ``0``):
+
+.. code-block:: python
+
+    >>> xr.open_dataset('duplicates.grib2', engine='cfgrib',
+    ...     backend_kwargs={'duplicate_messages': 'stack',
+    ...                     'filter_by_keys': {'grib_occurrence': [0, 2]}})
+
+A cell that has no message for the selected occurrence stays in the cube and is filled with
+``NaN``; if no message in the whole selected range matches, a ``ValueError`` is raised.
+Beware that ``True``/``False``, negative numbers, floats and empty lists are rejected, and that
+``grib_occurrence`` is an error unless ``duplicate_messages="stack"`` is set.
+
+Only the selected occurrences are decoded lazily when the values are accessed, so opening a file
+with many messages and reading a single occurrence or a single time does not decode the others.
+The indexes built for ``first`` and ``stack`` are kept separate on disk and never mixed up.
+
+The addressing state stored while opening is a sparse mapping from
+``(non-spatial coordinate cell, occurrence ordinal)`` to a single message id, so its size is
+proportional to the number of messages, not to the cartesian product of the coordinate lengths
+times the number of grid points. For a long file with only a few duplicates this adds one small
+entry per message and each requested cell still costs one dictionary lookup; for a few cells with
+many duplicates the ordinal run gets long while the mapping and the decoded work stay
+proportional to the messages actually read. The data cube itself is still allocated (filled with
+``NaN``) only for the requested block when values are accessed.
+
+
 Automatic filtering
 -------------------
-
 *cfgrib* also provides a function that automates the selection of appropriate ``filter_by_keys``
 and returns a list of all valid ``xarray.Dataset``'s in the GRIB file.
 

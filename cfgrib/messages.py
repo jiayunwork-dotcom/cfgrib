@@ -20,6 +20,7 @@
 import contextlib
 import hashlib
 import logging
+import numbers
 import os
 import pickle
 import typing as T
@@ -71,7 +72,76 @@ KEY_TYPES = {
 DEFAULT_INDEXPATH = "{path}.{short_hash}.idx"
 DEFAULT_VALUES_DTYPE = np.dtype("float32")
 
+#
+# Virtual key and modes used to keep more than one GRIB message per set of header coordinates.
+#
+GRIB_OCCURRENCE_KEY = "grib_occurrence"
+DUPLICATE_MESSAGES_FIRST = "first"
+DUPLICATE_MESSAGES_STACK = "stack"
+DUPLICATE_MESSAGES_MODES = (DUPLICATE_MESSAGES_FIRST, DUPLICATE_MESSAGES_STACK)
+
 OffsetType = T.Union[int, T.Tuple[int, int]]
+
+
+def resolve_duplicate_messages(value: T.Any) -> str:
+    """Validate and normalise the ``duplicate_messages`` opening option."""
+    if isinstance(value, str) and value in DUPLICATE_MESSAGES_MODES:
+        return value
+    raise ValueError(
+        "duplicate_messages must be one of %r, got %r"
+        % (list(DUPLICATE_MESSAGES_MODES), value)
+    )
+
+
+def _validate_occurrence_scalar(value: T.Any) -> int:
+    # NOTE: bool is an int subclass, but it is not a valid occurrence number
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError("grib_occurrence values must be non-negative integers, got %r" % (value,))
+    if value < 0:
+        raise ValueError("grib_occurrence values must be non-negative integers, got %r" % (value,))
+    return int(value)
+
+
+def validate_grib_occurrence_filter(value: T.Any) -> T.List[int]:
+    """Validate the value of a ``grib_occurrence`` filter, returning a list of ordinals."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            raise ValueError("grib_occurrence filter cannot be an empty list")
+        return [_validate_occurrence_scalar(v) for v in value]
+    return [_validate_occurrence_scalar(value)]
+
+
+def grib_occurrence_filter_key(filter_by_keys: T.Mapping[str, T.Any]) -> T.Optional[str]:
+    """Return the key used in ``filter_by_keys`` for the occurrence filter, if any."""
+    for key in filter_by_keys:
+        if key.partition(":")[0] == GRIB_OCCURRENCE_KEY:
+            return key
+    return None
+
+
+def normalize_filter_by_keys(
+    filter_by_keys: T.Mapping[str, T.Any], duplicate_messages: T.Any
+) -> T.Tuple[str, T.Dict[str, T.Any]]:
+    """Validate the duplicate-messages mode together with the ``filter_by_keys`` mapping.
+
+    Returns the normalised mode and a copy of ``filter_by_keys`` where the occurrence filter,
+    if any, has been validated and stored under its plain virtual key.
+    """
+    mode = resolve_duplicate_messages(duplicate_messages)
+    normalized = dict(filter_by_keys)
+    occurrence_key = grib_occurrence_filter_key(normalized)
+    if occurrence_key is not None:
+        if mode != DUPLICATE_MESSAGES_STACK:
+            raise ValueError(
+                "filter_by_keys %r requires duplicate_messages=%r"
+                % (occurrence_key, DUPLICATE_MESSAGES_STACK)
+            )
+        normalized[GRIB_OCCURRENCE_KEY] = validate_grib_occurrence_filter(
+            normalized.pop(occurrence_key)
+        )
+    return mode, normalized
 
 
 @attr.attrs(auto_attribs=True)
@@ -348,6 +418,12 @@ class FileStream(abc.MappingFieldset[OffsetType, Message]):
         return sum(1 for _ in self.items())
 
 
+#
+# NOTE: the on-disk index is keyed by the exact list of ``index_keys``. An index built before
+# ``grib_occurrence`` existed does not carry that key, so it can never be reused in "stack"
+# mode: the requested keys mismatch and the index is rebuilt from the GRIB file. This keeps the
+# legacy index files usable in "first" mode without any change.
+#
 ALLOWED_PROTOCOL_VERSION = "2"
 
 
@@ -364,6 +440,9 @@ class FieldsetIndex(abc.Index[T.Any, abc.Field]):
     )
     computed_keys: ComputedKeysType = {}
     index_protocol_version: str = ALLOWED_PROTOCOL_VERSION
+    # NOTE: set on subindices created by a ``grib_occurrence`` filter and holds the coordinate
+    #   range selected by the ordinary GRIB conditions only.
+    range_index: T.Optional[T.Any] = attr.attrib(default=None, repr=False, eq=False)
 
     @classmethod
     def from_fieldset(
@@ -389,10 +468,18 @@ class FieldsetIndex(abc.Index[T.Any, abc.Field]):
         field_ids_index = {}  # type: T.Dict[T.Tuple[T.Any, ...], T.List[T.Any]]
         index_keys = list(index_keys)
         header_values_cache = {}  # type: T.Dict[T.Tuple[T.Any, type], T.Any]
+        occurrence_index = (
+            index_keys.index(GRIB_OCCURRENCE_KEY) if GRIB_OCCURRENCE_KEY in index_keys else None
+        )
+        occurrence_counters = {}  # type: T.Dict[T.Tuple[T.Any, ...], int]
         for field_id, raw_field in iteritems:
             field = ComputedKeysAdapter(raw_field, computed_keys)
             header_values = []
             for key in index_keys:
+                if key == GRIB_OCCURRENCE_KEY:
+                    # NOTE: the value is computed below from the other header values
+                    header_values.append(None)
+                    continue
                 try:
                     try:
                         value = field[key]
@@ -413,6 +500,13 @@ class FieldsetIndex(abc.Index[T.Any, abc.Field]):
                 #   it also reduces the on-disk size of the index in a backward compatible way.
                 value = header_values_cache.setdefault((value, type(value)), value)
                 header_values.append(value)
+            if occurrence_index is not None:
+                # NOTE: the occurrence ordinal is local to a single group of non-spatial
+                #   header values and follows the order the messages appear in the source.
+                cell_key = tuple(header_values)
+                occurrence = occurrence_counters.get(cell_key, 0)
+                occurrence_counters[cell_key] = occurrence + 1
+                header_values[occurrence_index] = occurrence
             field_ids_index.setdefault(tuple(header_values), []).append(field_id)
         self = cls(
             fieldset,
@@ -462,9 +556,48 @@ class FieldsetIndex(abc.Index[T.Any, abc.Field]):
             raise ValueError("not one value for %r: %r" % (item, len(values)))
         return values[0]
 
-    def subindex(self, filter_by_keys={}, **query):
-        # type: (C, T.Mapping[str, T.Any], T.Any) -> C
+    def subindex(self, filter_by_keys={}, strict_occurrence=True, **query):
+        # type: (C, T.Mapping[str, T.Any], bool, T.Any) -> C
         query.update(filter_by_keys)
+        occurrence_key = grib_occurrence_filter_key(query)
+        if occurrence_key is not None:
+            if GRIB_OCCURRENCE_KEY not in self.index_keys:
+                raise ValueError(
+                    "filter_by_keys %r requires duplicate_messages=%r"
+                    % (occurrence_key, DUPLICATE_MESSAGES_STACK)
+                )
+            # NOTE: the occurrence filter uses the plain virtual key and keeps the original
+            #   ordinal as the coordinate label, it never renumbers the selected messages.
+            query[GRIB_OCCURRENCE_KEY] = validate_grib_occurrence_filter(
+                query.pop(occurrence_key)
+            )
+        ordinary_query = {
+            k: v for k, v in query.items() if k.partition(":")[0] != GRIB_OCCURRENCE_KEY
+        }
+        field_ids_index = self._filter_field_ids_index(query)
+        if occurrence_key is not None and not field_ids_index and strict_occurrence:
+            raise ValueError(
+                "no message matches filter_by_keys %r"
+                % {occurrence_key: query[GRIB_OCCURRENCE_KEY]}
+            )
+        index = type(self)(
+            fieldset=self.fieldset,
+            index_keys=self.index_keys,
+            field_ids_index=field_ids_index,
+            filter_by_keys=query,
+        )
+        # NOTE: remember the coordinate range selected by the ordinary GRIB conditions only,
+        #   so that a cell missing a selected occurrence keeps its coordinates (NaN) instead of
+        #   vanishing from the data cube.
+        previous_range = getattr(self, "range_index", None)
+        if previous_range is not None or occurrence_key is not None:
+            base = self if previous_range is None else previous_range
+            index.range_index = base.subindex(ordinary_query, strict_occurrence=False)
+        return index
+
+    def _filter_field_ids_index(
+        self, query: T.Mapping[str, T.Any]
+    ) -> T.List[T.Tuple[T.Tuple[T.Any, ...], T.List[T.Any]]]:
         raw_query = [(self.index_keys.index(k), v) for k, v in query.items()]
         field_ids_index = []
         for header_values, field_ids_values in self.field_ids_index:
@@ -476,13 +609,7 @@ class FieldsetIndex(abc.Index[T.Any, abc.Field]):
                     break
             else:
                 field_ids_index.append((header_values, field_ids_values))
-        index = type(self)(
-            fieldset=self.fieldset,
-            index_keys=self.index_keys,
-            field_ids_index=field_ids_index,
-            filter_by_keys=query,
-        )
-        return index
+        return field_ids_index
 
     def get_field(self, message_id: T.Any) -> abc.Field:
         return ComputedKeysAdapter(self.fieldset[message_id], self.computed_keys)
@@ -521,6 +648,9 @@ class FileIndex(FieldsetIndex):
     )
     computed_keys: ComputedKeysType = {}
     index_protocol_version: str = ALLOWED_PROTOCOL_VERSION
+    # NOTE: set on subindices created by a ``grib_occurrence`` filter and holds the coordinate
+    #   range selected by the ordinary GRIB conditions only.
+    range_index: T.Optional[T.Any] = attr.attrib(default=None, repr=False, eq=False)
 
     @classmethod
     def from_indexpath_or_filestream(
