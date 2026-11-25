@@ -5,6 +5,18 @@ Changelog for cfgrib
 unreleased
 ----------
 
+- Add ``cfgrib.interval_totals(path, intervals, *, backend_kwargs=None)`` to build the exact
+  accumulated total over arbitrary target intervals from GRIB2 ``stepType=accum`` messages.
+  A target is reported only when it is identical in every assignment of cumulative values that
+  reproduces the observations, with per-point/per-reference reference residual checks and
+  missing values where the target cannot be determined; nothing is split in proportion to a
+  duration or filled by a norm-minimising preference. The result is a lazy ``xarray.Dataset``
+  with ``time`` and ``interval`` non-spatial axes plus ``step_bounds``, ``step``,
+  ``valid_time_bounds`` and ``valid_time`` coordinates. The existing writer emits one GRIB2
+  accumulation message per reference time and target interval, including all-missing fields,
+  and rejects invalid or conflicting interval coordinates before writing anything. See
+  ``tests/test_70_interval_totals.py`` and ``tests/test_70_interval_totals_write.py``.
+
 - Add ``duplicate_messages="stack"`` to keep every GRIB message that repeats the same
   non-spatial coordinates (same time, step, level, member, ...) instead of only the first one.
   The new ``grib_occurrence`` coordinate numbers the occurrences within each cell, and the

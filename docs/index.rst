@@ -56,4 +56,5 @@ Limitations:
     cfmessage
     dataset
     xarray_store
+    interval_totals
     xarray_to_grib

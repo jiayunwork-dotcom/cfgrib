@@ -33,3 +33,10 @@ try:
     from .xarray_store import open_dataset, open_datasets
 except ImportError:
     pass
+
+# NOTE: ``interval_totals`` returns an xarray Dataset, so it is only importable
+#   when xarray is installed, exactly like the other xarray helpers above.
+try:
+    from .intervals import IntervalTotalsError, interval_totals
+except ImportError:
+    pass

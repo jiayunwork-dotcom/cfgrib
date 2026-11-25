@@ -710,6 +710,71 @@ and returns a list of all valid ``xarray.Dataset``'s in the GRIB file.
 Advanced usage
 ==============
 
+Exact accumulation totals over arbitrary intervals
+--------------------------------------------------
+
+A ``stepType=accum`` GRIB2 message stores the total accumulated between two steps
+that are relative to *its own* reference time, with a left-open / right-closed
+convention. Summing or differencing such messages as if they shared a single
+column of durations is wrong, because their intervals need not tile the time axis.
+
+``cfgrib.interval_totals`` solves the resulting set of linear constraints exactly:
+it returns a target total only when *every* assignment of cumulative values that
+reproduces the observed accumulations gives the same value. It never splits a total
+in proportion to a duration, never assumes a uniform rate and never fills the
+remaining degrees of freedom with a minimum-norm (or other) preference.
+
+.. code-block:: python
+
+    >>> from cfgrib import interval_totals
+    >>> ds = interval_totals(
+    ...     'accumulations.grib',
+    ...     [(np.timedelta64(0, 'h'), np.timedelta64(9, 'h')),
+    ...      (np.timedelta64(1, 'h'), np.timedelta64(3, 'h'))],
+    ... )
+    >>> ds
+    <xarray.Dataset>
+    Dimensions:     (time: 1, interval: 2, latitude: 3, longitude: 4, bounds: 2)
+    Coordinates:
+      * time        (time) datetime64[ns] 2020-01-01
+      * interval    (interval) int64 0 1
+        step        (interval) timedelta64[ns] 09:00:00 03:00:00
+        step_bounds (interval, bounds) timedelta64[ns] 00:00:00 ... 09:00:00
+        valid_time  (time, interval) datetime64[ns] ...
+        valid_time_bounds (time, interval, bounds) datetime64[ns] ...
+      * latitude    (latitude) float64 10.0 5.0 0.0
+      * longitude   (longitude) float64 0.0 10.0 20.0 30.0
+    Data variables:
+        tp          (time, interval, latitude, longitude) float64 ...
+
+With three messages ``(0,6] = 9``, ``(3,6] = 4`` and ``(3,9] = 10`` the target
+``(0,9]`` is uniquely ``15`` while ``(1,3]`` is left missing (``NaN``), because the
+observations do not pin it down. Messages from different reference times never
+borrow constraints from each other, even when their valid times coincide.
+
+The result is lazy: building it only reads headers and coordinates, and reading a
+single reference time decodes only the messages of that reference time, in chunks
+whose resident size is at most one spatial field. The target totals keep the
+physical quantity's name, units and latitude/longitude coordinates, and the
+``interval`` axis is never squeezed away even when there is a single interval.
+
+The same constraints are used to reject non-conforming input: only GRIB2,
+``regular_ll``, ``surface``, single statistical range, deterministic
+``stepType=accum`` messages are accepted; time units must be one of second, minute,
+hour or day; and two messages describing the same reference time, quantity, grid
+and interval are refused instead of picking one of them. All of these checks run
+before any field value is decoded; invalid arguments and headers raise
+``cfgrib.IntervalTotalsError`` (a ``ValueError``).
+
+Results can be written back with the existing writer, which emits one GRIB2
+accumulation message per reference time and target interval (including all-missing
+fields) and records the exact start/end steps:
+
+.. code-block:: python
+
+    >>> from cfgrib.xarray_to_grib import to_grib
+    >>> to_grib(ds, 'totals.grib')
+
 Write support
 =============
 
